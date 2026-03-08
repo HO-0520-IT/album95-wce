@@ -1,3 +1,27 @@
+# album95-wce
+
+album95 の Windows CE （おそらく 4.0 以降）対応版です。
+
+現在の課題は issue をご覧ください。
+
+## オリジナル版からの仕様変更点
+
+- デフォルトの音楽フォルダが ``\Storage Card\Music``
+- デフォルトの再生周波数が 22050 Hz
+
+## 使い方
+
+1. Release より zip ファイルをダウンロードしてください。
+2. [BASS for WinCE](https://www.un4seen.com/forum/?topic=9534.0) より、 bass24-ce.zip と bass_aac-ce.zip をダウンロードしてください。
+3. 1 と 2 でダウンロードした、zipファイルをそれぞれ解凍し、 Album95.exe 、 bass.dll 、bass_aac.dll を抜き出してください。
+4. 3 で抜き出した3つのファイルが同じディレクトリにあるように、何らかの方法で WinCE 実機に転送するか、 WinCE が読み取れるメモリカードに書き込んでください。
+5. WinCE 実機で Album95.exe を実行してください。
+
+## 備考
+このプログラムの一部は ChatGPT 、 Gemini 、 GitHub Copilot を使用して編集されました。
+
+---
+
 # album95
 
 album95 is a lightweight album-oriented music player for Windows 95 and later.

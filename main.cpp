@@ -46,8 +46,16 @@
 #define TIMER_SCANPROG      1
 #define TIMER_PLAYPOS       2
 
-static std::string g_root = "C:\\Music";
-static DWORD g_bass_rate = 44100;
+#ifdef _WIN32_WCE
+#define A95_MUSIC_DIR "\\Storage Card\\Music"
+#define A95_SAMPLE_RATE 22050
+#else
+#define A95_MUSIC_DIR "C:\\Music"
+#define A95_SAMPLE_RATE 44100
+#endif
+
+static std::string g_root = A95_MUSIC_DIR;
+static DWORD g_bass_rate = A95_SAMPLE_RATE;
 static HWND g_hwnd = NULL;
 static HINSTANCE g_inst = NULL;
 
@@ -61,7 +69,11 @@ static CRITICAL_SECTION g_scan_cs;
 static HWND g_status = NULL;
 
 static HWND g_tip = NULL;
+#ifdef _WIN32_WCE
+static wchar_t g_tipbuf[256];
+#else
 static char g_tipbuf[256];
+#endif
 
 static HWND g_tracks = NULL;
 static std::string g_current_album_key;
@@ -129,11 +141,19 @@ static void update_play_button_label();
 static const char* basenameA(const std::string& s);
 
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
+#ifdef _WIN32_WCE
+    wchar_t buf[256];
+    wsprintfW(buf, L"CRASH: code=0x%08X addr=0x%08X",
+              (unsigned)ep->ExceptionRecord->ExceptionCode,
+              (unsigned)ep->ExceptionRecord->ExceptionAddress);
+    MessageBoxW(NULL, buf, L"Album95", MB_OK | MB_ICONERROR);
+#else
     char buf[256];
     wsprintfA(buf, "CRASH: code=0x%08X addr=0x%08X",
               (unsigned)ep->ExceptionRecord->ExceptionCode,
               (unsigned)ep->ExceptionRecord->ExceptionAddress);
     MessageBoxA(NULL, buf, "Album95", MB_OK | MB_ICONERROR);
+#endif
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
@@ -274,6 +294,11 @@ static std::wstring utf8_to_wide(const std::string& s)
 
 static std::string utf8_to_acp(const std::string& u8)
 {
+#ifdef _WIN32_WCE
+    // WinCE では常に UTF-8 を使うことにする（ACP は存在しないものとみなす）。
+    return u8;
+#endif
+
     std::wstring w = utf8_to_wide(u8);
 
     int len = WideCharToMultiByte(
@@ -337,6 +362,19 @@ static int atom_type_eq(const char type[4], const char* s)
            type[3] == s[3];
 }
 
+static FILE* my_fopen(const char* path, const char* mode) {
+#ifdef _WIN32_WCE
+    wchar_t wpath[256];
+    wchar_t wmode[16];
+
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, MAX_PATH);
+    MultiByteToWideChar(CP_UTF8, 0, mode, -1, wmode, 16);
+    return _wfopen(wpath, wmode);
+#else
+    return fopen(path, mode);
+#endif
+}
+
 static void format_mmss(int sec, char* out)
 {
     if (sec < 0) sec = 0;
@@ -344,12 +382,22 @@ static void format_mmss(int sec, char* out)
     int m = sec / 60;
     int s = sec % 60;
 
+#ifdef _WIN32_WCE
+    // wsprintW を使用して結合後、ASCII 文字列に変換する（WinCE では ACP がないため）。
+    wchar_t wbuf[32];
+    wsprintfW(wbuf, L"%d:%02d", m, s);
+    // 強制的にASCII文字として1バイトずつ転送し、確実に終端させる
+    int i = 0;
+    while (wbuf[i] && i < 31) { out[i] = (char)wbuf[i]; i++; }
+    out[i] = '\0';
+#else
     wsprintfA(out, "%d:%02d", m, s);
+#endif
 }
 
 static int read_m4a_duration_sec_from_mvhd(const char* path)
 {
-    FILE* fp = fopen(path, "rb");
+    FILE* fp = my_fopen(path, "rb");
     if (!fp) return 0;
 
     for (;;) {
@@ -452,23 +500,24 @@ static int read_m4a_duration_sec_from_mvhd(const char* path)
 static bool mp4_get_safe(const char* tags, const char* key, std::string& out) {
     if (!tags) return false;
 
-    // タグ領域は最大64KBだけ信用する（安全弁）
-    const size_t MAX = 64 * 1024;
-    const char* end0 = find_double_nul(tags, MAX);
-    if (!end0) return false; // 終端が見つからない＝文字列リストではない/壊れてる
-
     size_t klen = strlen(key);
-
     const char* p = tags;
-    while (p < end0 && *p) {
-        size_t len = safe_strnlen0(p, end0);
-        if (len == 0) break;
-
-        if (len > klen + 1 && !strncmp(p, key, klen) && p[klen] == '=') {
-            out.assign(p + klen + 1, p + len);
+    
+    // 64KB制限内で検索
+    while (p && *p) {
+        // 現在のタグ文字列の長さを取得
+        size_t len = strlen(p);
+        
+        // key=value の形式かチェック
+        // keyの長さ + '=' (1文字) より長い必要がある
+        if (len > klen && strncmp(p, key, klen) == 0 && p[klen] == '=') {
+            out.assign(p + klen + 1);
             return true;
         }
+        
+        // 次のタグへ
         p += len + 1;
+        if (p - tags > 65536) break;
     }
     return false;
 }
@@ -611,10 +660,20 @@ static bool track_sort_album(const Track& a, const Track& b)
 }
 
 static bool read_meta_m4a(const char* path, Meta& m) {
+#ifdef _WIN32_WCE
+    wchar_t wpath[MAX_PATH];
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, MAX_PATH);
+    HSTREAM ch = BASS_StreamCreateFile(FALSE, wpath, 0, 0, BASS_STREAM_DECODE | BASS_UNICODE);
+#else
     HSTREAM ch = BASS_StreamCreateFile(FALSE, path, 0, 0, BASS_STREAM_DECODE);
+#endif
     if (!ch) return false;
 
+#ifdef _WIN32_WCE
+    const char* tags = (const char*)BASS_ChannelGetTags(ch, BASS_TAG_MP4);
+#else
     const char* tags = (const char*)BASS_StreamGetTags(ch, BASS_TAG_MP4);
+#endif
 
     if (tags) {
         mp4_get_safe(tags, "album", m.album);
@@ -665,17 +724,41 @@ static std::string make_album_key(const Meta& m) {
 
 static std::string get_cache_dir()
 {
+#ifdef _WIN32_WCE
+    wchar_t exe_w[MAX_PATH] = {0};
+    GetModuleFileNameW(NULL, exe_w, MAX_PATH);
+    char exe_a[MAX_PATH];
+    WideCharToMultiByte(CP_UTF8, 0, exe_w, -1, exe_a, MAX_PATH, NULL, NULL);
+    char* p = strrchr(exe_a, '\\');
+    if (p) *p = 0;
+    std::string dir = std::string(exe_a) + "\\cache";
+    wchar_t dir_w[MAX_PATH];
+    MultiByteToWideChar(CP_UTF8, 0, dir.c_str(), -1, dir_w, MAX_PATH);
+    CreateDirectoryW(dir_w, NULL);
+#else
     char exe[MAX_PATH] = {0};
     GetModuleFileNameA(NULL, exe, MAX_PATH);
     char* p = strrchr(exe, '\\');
     if (p) *p = 0;
     std::string dir = std::string(exe) + "\\cache";
     CreateDirectoryA(dir.c_str(), NULL);
+#endif
     return dir;
 }
 
 static std::string get_ini_path()
 {
+#ifdef _WIN32_WCE
+    wchar_t exe_w[MAX_PATH] = {0};
+    GetModuleFileNameW(NULL, exe_w, MAX_PATH);
+    char exe_a[MAX_PATH];
+    WideCharToMultiByte(CP_UTF8, 0, exe_w, -1, exe_a, MAX_PATH, NULL, NULL);
+
+    char* p = strrchr(exe_a, '\\');
+    if (p) *p = 0;
+
+    return std::string(exe_a) + "\\album95.ini";
+#else
     char exe[MAX_PATH] = {0};
     GetModuleFileNameA(NULL, exe, MAX_PATH);
 
@@ -683,6 +766,7 @@ static std::string get_ini_path()
     if (p) *p = 0;
 
     return std::string(exe) + "\\album95.ini";
+#endif
 }
 
 static void load_settings_from_ini()
@@ -690,41 +774,91 @@ static void load_settings_from_ini()
     char buf[MAX_PATH] = {0};
     std::string ini = get_ini_path();
 
+#ifdef _WIN32_WCE
+    wchar_t buf_w[MAX_PATH] = {0};
+    wchar_t music_dir_w[MAX_PATH];
+    MultiByteToWideChar(CP_UTF8, 0, A95_MUSIC_DIR, -1, music_dir_w, MAX_PATH);
+    GetPrivateProfileStringW(
+        L"General",
+        L"MusicRoot",
+        music_dir_w,
+        buf_w,
+        MAX_PATH,
+        utf8_to_wide(ini).c_str()
+    );
+    WideCharToMultiByte(CP_UTF8, 0, buf_w, -1, buf, MAX_PATH, NULL, NULL);
+#else
     GetPrivateProfileStringA(
         "General",
         "MusicRoot",
-        "C:\\Music",
+        A95_MUSIC_DIR,
         buf,
         MAX_PATH,
         ini.c_str()
     );
+#endif
 
     if (buf[0])
         g_root = buf;
     else
-        g_root = "C:\\Music";
+        g_root = A95_MUSIC_DIR;
 
     char ratebuf[64] = {0};
+#ifdef _WIN32_WCE
+    wchar_t ratebuf_w[64] = {0};
+    wchar_t default_rate_w[64];
+    wsprintfW(default_rate_w, L"%lu", (unsigned long)A95_SAMPLE_RATE);
+    GetPrivateProfileStringW(
+        L"General",
+        L"SampleRate",
+        default_rate_w,
+        ratebuf_w,
+        sizeof(ratebuf_w) / sizeof(wchar_t),
+        std::wstring(ini.begin(), ini.end()).c_str()
+    );
+    WideCharToMultiByte(CP_UTF8, 0, ratebuf_w, -1, ratebuf, 64, NULL, NULL);
+#else
+    char default_rate[64];
+    wsprintfA(default_rate, "%lu", (unsigned long)A95_SAMPLE_RATE);
     GetPrivateProfileStringA(
         "General",
         "SampleRate",
-        "44100",
+        default_rate,
         ratebuf,
         sizeof(ratebuf),
         ini.c_str()
     );
+#endif
 
     int rate = atoi(ratebuf);
     if (rate == 32000)
         g_bass_rate = 32000;
     else
-        g_bass_rate = 44100;
+        g_bass_rate = A95_SAMPLE_RATE;
 }
 
 static void save_settings_to_ini()
 {
     std::string ini = get_ini_path();
 
+#ifdef _WIN32_WCE
+    WritePrivateProfileStringW(
+        L"General",
+        L"MusicRoot",
+        utf8_to_wide(g_root).c_str(),
+        utf8_to_wide(ini).c_str()
+    );
+
+    wchar_t ratebuf[32];
+    wsprintfW(ratebuf, L"%lu", (unsigned long)g_bass_rate);
+
+    WritePrivateProfileStringW(
+        L"General",
+        L"SampleRate",
+        ratebuf,
+        utf8_to_wide(ini).c_str()
+    );
+#else
     WritePrivateProfileStringA(
         "General",
         "MusicRoot",
@@ -741,6 +875,7 @@ static void save_settings_to_ini()
         ratebuf,
         ini.c_str()
     );
+#endif
 }
 
 static int is_shift_pressed_at_startup()
@@ -750,19 +885,30 @@ static int is_shift_pressed_at_startup()
 
 static void choose_startup_sample_rate()
 {
+#ifdef _WIN32_WCE
+    wchar_t msg[256];
+    wsprintfW(msg, L"Use 32 kHz output sample rate?\n\nYes = 32000 Hz\nNo  = %d Hz", A95_SAMPLE_RATE);
+    int r = MessageBoxW(
+        NULL,
+        msg,
+        L"Album95",
+        MB_YESNO | MB_ICONQUESTION
+    );
+#else
+    char msg[256];
+    wsprintfA(msg, "Use 32 kHz output sample rate?\n\nYes = 32000 Hz\nNo  = %d Hz", A95_SAMPLE_RATE);
     int r = MessageBoxA(
         NULL,
-        "Use 32 kHz output sample rate?\n\n"
-        "Yes = 32000 Hz\n"
-        "No  = 44100 Hz",
+        msg,
         "Album95",
         MB_YESNO | MB_ICONQUESTION
     );
+#endif
 
     if (r == IDYES)
         g_bass_rate = 32000;
     else
-        g_bass_rate = 44100;
+        g_bass_rate = A95_SAMPLE_RATE;
 }
 
 static unsigned int fnv1a32(const char* s)
@@ -777,18 +923,36 @@ static unsigned int fnv1a32(const char* s)
 
 static std::string make_cache_path_for_key(const std::string& key)
 {
+#ifdef _WIN32_WCE
+    wchar_t buf[64];
+    unsigned int h = fnv1a32(key.c_str());
+    wsprintfW(buf, L"%08X.bmp", h);
+    char cbuf[64];
+    WideCharToMultiByte(CP_UTF8, 0, buf, -1, cbuf, 64, NULL, NULL);
+    return get_cache_dir() + "\\" + cbuf;
+#else
     char buf[64];
     unsigned int h = fnv1a32(key.c_str());
     wsprintfA(buf, "%08X.bmp", h);
     return get_cache_dir() + "\\" + buf;
+#endif
 }
 
 static HBITMAP load_cached_bmp(const char* path)
 {
+#ifdef _WIN32_WCE
+    wchar_t wpath[MAX_PATH];
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, MAX_PATH);
+    return (HBITMAP)LoadImageW(
+        NULL, wpath, IMAGE_BITMAP, 0, 0,
+        LR_LOADFROMFILE | LR_CREATEDIBSECTION
+    );
+#else
     return (HBITMAP)LoadImageA(
         NULL, path, IMAGE_BITMAP, 0, 0,
         LR_LOADFROMFILE | LR_CREATEDIBSECTION
     );
+#endif
 }
 
 #pragma pack(push,1)
@@ -836,7 +1000,7 @@ static bool save_hbitmap_as_bmp24(const char* path, HBITMAP hbmp, int w, int h)
     fh.bfReserved1 = 0;
     fh.bfReserved2 = 0;
 
-    FILE* f = fopen(path, "wb");
+    FILE* f = my_fopen(path, "wb");
     if (!f) return false;
 
     fwrite(&fh, 1, sizeof(fh), f);
@@ -872,8 +1036,46 @@ static void add_track2(const std::string& key, const std::string& file, const Me
 
 static int browse_for_music_folder(HWND owner, std::string& out_path)
 {
+#ifdef _WIN32_WCE
+    // 参考： https://goldeneye2.videolan.org/robertogarci0938/vlc/-/blob/1.0.0-pre2/modules/gui/wince/dialogs.cpp
+    #define SHGetMalloc MySHGetMalloc
+    #define SHBrowseForFolder MySHBrowseForFolder
+    #define SHGetPathFromIDList MySHGetPathFromIDList
+
+    HMODULE ceshell_dll = LoadLibrary( L"ceshell" );
+    if( !ceshell_dll ) return 0;
+
+    HRESULT (WINAPI *SHGetMalloc)(LPMALLOC *) =
+        (HRESULT (WINAPI *)(LPMALLOC *))
+        GetProcAddress( ceshell_dll, L"SHGetMalloc" );
+    LPITEMIDLIST (WINAPI *SHBrowseForFolder)(LPBROWSEINFO) =
+        (LPITEMIDLIST (WINAPI *)(LPBROWSEINFO))
+        GetProcAddress( ceshell_dll, L"SHBrowseForFolder" );
+    BOOL (WINAPI *SHGetPathFromIDList)(LPCITEMIDLIST, LPTSTR) =
+        (BOOL (WINAPI *)(LPCITEMIDLIST, LPTSTR))
+        GetProcAddress( ceshell_dll, L"SHGetPathFromIDList" );
+
+
+    if( !SHGetMalloc || !SHBrowseForFolder || !SHGetPathFromIDList )
+    {
+        // どれかの関数が見つからない場合はエラーダイアログ表示
+        MessageBox(owner, L"Failed to load required functions", L"Error", MB_OK | MB_ICONERROR);
+        FreeLibrary( ceshell_dll );
+        return 0;
+    }
+#endif
     char display[MAX_PATH] = {0};
 
+#ifdef _WIN32_WCE
+    BROWSEINFOW bi;
+    ZeroMemory(&bi, sizeof(bi));
+    bi.hwndOwner = owner;
+    bi.pszDisplayName = (WCHAR*)display;
+    bi.lpszTitle = L"Select music folder";
+    bi.ulFlags = BIF_RETURNONLYFSDIRS;
+
+    LPITEMIDLIST pidl = SHBrowseForFolder(&bi);
+#else
     BROWSEINFOA bi;
     ZeroMemory(&bi, sizeof(bi));
     bi.hwndOwner = owner;
@@ -882,11 +1084,17 @@ static int browse_for_music_folder(HWND owner, std::string& out_path)
     bi.ulFlags = BIF_RETURNONLYFSDIRS;
 
     LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
+#endif
     if (!pidl)
         return 0;
 
+#ifdef _WIN32_WCE
+    wchar_t path[MAX_PATH] = {0};
+    int ok = SHGetPathFromIDList(pidl, path);
+#else
     char path[MAX_PATH] = {0};
     int ok = SHGetPathFromIDListA(pidl, path);
+#endif
 
     LPMALLOC pMalloc = NULL;
     if (SUCCEEDED(SHGetMalloc(&pMalloc)) && pMalloc) {
@@ -897,23 +1105,53 @@ static int browse_for_music_folder(HWND owner, std::string& out_path)
     if (!ok || !path[0])
         return 0;
 
+#ifdef _WIN32_WCE
+    char path_a[MAX_PATH];
+    WideCharToMultiByte(CP_UTF8, 0, path, -1, path_a, MAX_PATH, NULL, NULL);
+    out_path = path_a;
+#else
     out_path = path;
+#endif
     return 1;
 }
 
 static void scan_folder(const std::string& path) {
+#ifdef _WIN32_WCE
+    WIN32_FIND_DATAW fd;
+#else
     WIN32_FIND_DATAA fd;
+#endif
     std::string pattern = path + "\\*";
+#ifdef _WIN32_WCE
+    wchar_t pattern_w[MAX_PATH];
+    MultiByteToWideChar(CP_UTF8, 0, pattern.c_str(), -1, pattern_w, MAX_PATH);
+    HANDLE h = FindFirstFileW(pattern_w, &fd);
+#else
     HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+#endif
     if (h == INVALID_HANDLE_VALUE) return;
 
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+#ifdef _WIN32_WCE
+            if (wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0) {
+                char name_a[MAX_PATH];
+                WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, name_a, MAX_PATH, NULL, NULL);
+                scan_folder(path + "\\" + name_a);
+            }
+#else
             if (strcmp(fd.cFileName, ".") != 0 && strcmp(fd.cFileName, "..") != 0) {
                 scan_folder(path + "\\" + fd.cFileName);
             }
+#endif
         } else {
+#ifdef _WIN32_WCE
+            char cFileName_a[MAX_PATH];
+            WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, cFileName_a, MAX_PATH, NULL, NULL);
+            std::string file = path + "\\" + cFileName_a;
+#else
             std::string file = path + "\\" + fd.cFileName;
+#endif
             if (ends_with_icase(file, ".m4a")) {
                 Meta m;
                 int duration_sec = 0;
@@ -924,7 +1162,14 @@ static void scan_folder(const std::string& path) {
                     int fd_disc = 0;
                     int fd_track = 0;
 
-                    if (parse_leading_disc_track_from_name(fd.cFileName, &fd_disc, &fd_track)) {
+#ifdef _WIN32_WCE
+                    char name_a[MAX_PATH];
+                    WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, name_a, MAX_PATH, NULL, NULL);
+                    if (parse_leading_disc_track_from_name(name_a, &fd_disc, &fd_track))
+#else
+                    if (parse_leading_disc_track_from_name(fd.cFileName, &fd_disc, &fd_track))
+#endif
+                    {
                         if (m.disc <= 0)
                             m.disc = fd_disc;
                         if (m.track <= 0)
@@ -943,7 +1188,12 @@ static void scan_folder(const std::string& path) {
                 LeaveCriticalSection(&g_scan_cs);
             }
         }
-    } while (FindNextFileA(h, &fd));
+    }
+#ifdef _WIN32_WCE
+    while (FindNextFileW(h, &fd));
+#else
+    while (FindNextFileA(h, &fd));
+#endif
 
     FindClose(h);
 }
@@ -955,7 +1205,13 @@ static DWORD WINAPI ScanThreadProc(LPVOID) {
     scan_folder(g_root);
 
     g_scan_done = 1;
-    if (g_hwnd) PostMessageA(g_hwnd, WM_APP_SCANDONE, 0, 0);
+    if (g_hwnd) {
+#ifdef _WIN32_WCE
+        PostMessageW(g_hwnd, WM_APP_SCANDONE, 0, 0);
+#else
+        PostMessageA(g_hwnd, WM_APP_SCANDONE, 0, 0);
+#endif
+    }
     return 0;
 }
 
@@ -1094,7 +1350,7 @@ static bool extract_covr(const char* path, std::vector<unsigned char>& out)
 {
     out.clear();
 
-    FILE* f = fopen(path, "rb");
+    FILE* f = my_fopen(path, "rb");
     if (!f) return false;
 
     fseek(f, 0, SEEK_END);
@@ -1344,16 +1600,33 @@ static HBITMAP image_from_memory(const unsigned char* data, int size) {
     return bmp;
 }
 
+#ifdef _WIN32_WCE
+static void CALLBACK on_stream_end(HSYNC /*handle*/, DWORD /*channel*/, DWORD /*data*/, void* /*user*/)
+{
+    // WinCE/CEGCC環境でPostMessageWが不安定なため、コールバックを無効化
+    // ストリーム終了時の自動再生は手動で行う
+}
+#else
 static void CALLBACK on_stream_end(HSYNC /*handle*/, DWORD /*channel*/, DWORD /*data*/, DWORD /*user*/)
 {
-    if (g_hwnd) PostMessageA(g_hwnd, WM_APP_NEXTTRACK, 0, 0);
+    if (g_hwnd)
+#ifdef _WIN32_WCE
+        PostMessageW(g_hwnd, WM_APP_NEXTTRACK, 0, 0);
+#else
+        PostMessageA(g_hwnd, WM_APP_NEXTTRACK, 0, 0);
+#endif
 }
+#endif
 
 static LRESULT CALLBACK control_subclass_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     if (msg == WM_KEYDOWN) {
         if (wParam == VK_SPACE) {
+#ifdef _WIN32_WCE
+            PostMessageW(g_hwnd, WM_APP_TOGGLEPLAY, 0, 0);
+#else
             PostMessageA(g_hwnd, WM_APP_TOGGLEPLAY, 0, 0);
+#endif
             return 0;
         }
 
@@ -1362,7 +1635,11 @@ static LRESULT CALLBACK control_subclass_proc(HWND hwnd, UINT msg, WPARAM wParam
                 int sel = ListView_GetNextItem(g_list, -1, LVNI_SELECTED);
                 if (sel >= 0) {
                     g_pending_sel = sel;
+#ifdef _WIN32_WCE
+                    PostMessageW(g_hwnd, WM_APP_PLAYSELECT, 0, 0);
+#else
                     PostMessageA(g_hwnd, WM_APP_PLAYSELECT, 0, 0);
+#endif
                 }
                 return 0;
             }
@@ -1370,7 +1647,11 @@ static LRESULT CALLBACK control_subclass_proc(HWND hwnd, UINT msg, WPARAM wParam
             if (hwnd == g_tracks) {
                 int sel = ListView_GetNextItem(g_tracks, -1, LVNI_SELECTED);
                 if (sel >= 0 && !g_current_album_key.empty()) {
+#ifdef _WIN32_WCE
+                    PostMessageW(g_hwnd, WM_APP_PLAYENTER, (WPARAM)sel, 0);
+#else
                     PostMessageA(g_hwnd, WM_APP_PLAYENTER, (WPARAM)sel, 0);
+#endif
                 }
                 return 0;
             }
@@ -1378,18 +1659,38 @@ static LRESULT CALLBACK control_subclass_proc(HWND hwnd, UINT msg, WPARAM wParam
     }
 
     if (hwnd == g_list && g_old_list_proc)
+#ifdef _WIN32_WCE
+        return CallWindowProcW(g_old_list_proc, hwnd, msg, wParam, lParam);
+#else
         return CallWindowProcA(g_old_list_proc, hwnd, msg, wParam, lParam);
+#endif
 
     if (hwnd == g_tracks && g_old_tracks_proc)
+#ifdef _WIN32_WCE
+        return CallWindowProcW(g_old_tracks_proc, hwnd, msg, wParam, lParam);
+#else
         return CallWindowProcA(g_old_tracks_proc, hwnd, msg, wParam, lParam);
+#endif
 
     if (hwnd == g_seekbar && g_old_seekbar_proc)
+#ifdef _WIN32_WCE
+        return CallWindowProcW(g_old_seekbar_proc, hwnd, msg, wParam, lParam);
+#else
         return CallWindowProcA(g_old_seekbar_proc, hwnd, msg, wParam, lParam);
+#endif
 
     if (hwnd == g_volbar && g_old_volbar_proc)
+#ifdef _WIN32_WCE
+        return CallWindowProcW(g_old_volbar_proc, hwnd, msg, wParam, lParam);
+#else
         return CallWindowProcA(g_old_volbar_proc, hwnd, msg, wParam, lParam);
+#endif
 
+#ifdef _WIN32_WCE
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+#else
     return DefWindowProcA(hwnd, msg, wParam, lParam);
+#endif
 }
 
 static LRESULT CALLBACK listview_subclass_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -1400,7 +1701,11 @@ static LRESULT CALLBACK listview_subclass_proc(HWND hwnd, UINT msg, WPARAM wPara
                 int sel = ListView_GetNextItem(g_list, -1, LVNI_SELECTED);
                 if (sel >= 0) {
                     g_pending_sel = sel;
+#ifdef _WIN32_WCE
+                    PostMessageW(g_hwnd, WM_APP_PLAYSELECT, 0, 0);
+#else
                     PostMessageA(g_hwnd, WM_APP_PLAYSELECT, 0, 0);
+#endif
                 }
                 return 0;
             }
@@ -1408,13 +1713,26 @@ static LRESULT CALLBACK listview_subclass_proc(HWND hwnd, UINT msg, WPARAM wPara
             if (hwnd == g_tracks) {
                 int sel = ListView_GetNextItem(g_tracks, -1, LVNI_SELECTED);
                 if (sel >= 0 && !g_current_album_key.empty()) {
+#ifdef _WIN32_WCE
+                    PostMessageW(g_hwnd, WM_APP_PLAYENTER, (WPARAM)sel, 0);
+#else
                     PostMessageA(g_hwnd, WM_APP_PLAYENTER, (WPARAM)sel, 0);
+#endif
                 }
                 return 0;
             }
         }
     }
 
+#ifdef _WIN32_WCE
+    if (hwnd == g_list && g_old_list_proc)
+        return CallWindowProcW(g_old_list_proc, hwnd, msg, wParam, lParam);
+
+    if (hwnd == g_tracks && g_old_tracks_proc)
+        return CallWindowProcW(g_old_tracks_proc, hwnd, msg, wParam, lParam);
+
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+#else
     if (hwnd == g_list && g_old_list_proc)
         return CallWindowProcA(g_old_list_proc, hwnd, msg, wParam, lParam);
 
@@ -1422,10 +1740,15 @@ static LRESULT CALLBACK listview_subclass_proc(HWND hwnd, UINT msg, WPARAM wPara
         return CallWindowProcA(g_old_tracks_proc, hwnd, msg, wParam, lParam);
 
     return DefWindowProcA(hwnd, msg, wParam, lParam);
+#endif
 }
 
 // ---- BASS再生 ----
+#ifdef _WIN32_WCE
+static void dbg(const WCHAR* s) { OutputDebugStringW(s); OutputDebugStringW(L"\n"); }
+#else
 static void dbg(const char* s) { OutputDebugStringA(s); OutputDebugStringA("\n"); }
+#endif
 
 static void play_file(const char* path) {
     if (g_stream) {
@@ -1434,20 +1757,42 @@ static void play_file(const char* path) {
         g_end_sync = 0;
     }
 
+#ifdef _WIN32_WCE
+    wchar_t wpath[MAX_PATH];
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, MAX_PATH);
+    g_stream = BASS_StreamCreateFile(FALSE, wpath, 0, 0, BASS_UNICODE);
+#else
     g_stream = BASS_StreamCreateFile(FALSE, path, 0, 0, 0);
+#endif
     if (!g_stream) {
+#ifdef _WIN32_WCE
+        wchar_t buf[256];
+        wsprintfW(buf, L"Open failed err=%d", BASS_ErrorGetCode());
+        dbg(buf);
+#else
         char buf[256];
         wsprintfA(buf, "Open failed err=%d", BASS_ErrorGetCode());
         dbg(buf);
+#endif
         return;
     }
 
+#ifdef _WIN32_WCE
+    g_end_sync = BASS_ChannelSetSync(g_stream, BASS_SYNC_END, 0, (SYNCPROC*)&on_stream_end, NULL);
+#else
     g_end_sync = BASS_ChannelSetSync(g_stream, BASS_SYNC_END, 0, &on_stream_end, 0);
+#endif
 
     if (!BASS_ChannelPlay(g_stream, FALSE)) {
+#ifdef _WIN32_WCE
+        wchar_t buf[128];
+        wsprintfW(buf, L"Play failed err=%d", BASS_ErrorGetCode());
+        dbg(buf);
+#else
         char buf[128];
         wsprintfA(buf, "Play failed err=%d", BASS_ErrorGetCode());
         dbg(buf);
+#endif
         return;
     }
 }
@@ -1473,8 +1818,13 @@ static void play_track_in_album(const std::string& album_key, int index)
         refresh_album_list_labels();
         populate_tracks(album_key);
     } else {
-        if (prev_index >= 0 && prev_index < ListView_GetItemCount(g_tracks))
+        if (prev_index >= 0 && prev_index < ListView_GetItemCount(g_tracks)) {
+#ifdef _WIN32_WCE
+            ListView_SetItemText(g_tracks, prev_index, 0, L"");
+#else
             ListView_SetItemText(g_tracks, prev_index, 0, (LPSTR)"");
+#endif
+        }
     }
 
     play_file(a.tracks[index].path.c_str());
@@ -1487,7 +1837,11 @@ static void play_track_in_album(const std::string& album_key, int index)
     );
     ListView_EnsureVisible(g_tracks, index, FALSE);
 
+#ifdef _WIN32_WCE
+    ListView_SetItemText(g_tracks, index, 0, L">");
+#else
     ListView_SetItemText(g_tracks, index, 0, (LPSTR)">");
+#endif
 
     update_playback_status();
     update_play_button_label();
@@ -1519,7 +1873,11 @@ static void play_next_in_album()
         update_play_button_label();
 
         if (g_seekbar)
+#ifdef _WIN32_WCE
+            SendMessageW(g_seekbar, TBM_SETPOS, TRUE, 0);
+#else
             SendMessageA(g_seekbar, TBM_SETPOS, TRUE, 0);
+#endif
 
         return;
     }
@@ -1607,6 +1965,19 @@ static void populate_list()
         if (a.cover)
             imgIndex = ImageList_Add(g_img, a.cover, NULL);
 
+#ifdef _WIN32_WCE
+        LVITEMW item;
+        ZeroMemory(&item, sizeof(item));
+        item.mask = LVIF_TEXT | LVIF_IMAGE;
+        item.iItem = index++;
+
+        a.disp_name = get_album_display_name(album_key, a);
+        std::wstring wdisp = utf8_to_wide(a.disp_name);
+        item.pszText = (LPWSTR)wdisp.c_str();
+        item.iImage = imgIndex;
+
+        ListView_InsertItem(g_list, &item);
+#else
         LVITEMA item;
         ZeroMemory(&item, sizeof(item));
         item.mask = LVIF_TEXT | LVIF_IMAGE;
@@ -1617,20 +1988,36 @@ static void populate_list()
         item.iImage = imgIndex;
 
         ListView_InsertItem(g_list, &item);
+#endif
 
         done++;
 
+#ifdef _WIN32_WCE
+        wchar_t buf[256];
+        wsprintfW(buf, L"Building album list %d / %d", done, total);
+        if (g_status)
+            SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)buf);
+#else
         char buf[256];
         wsprintfA(buf, "Building album list %d / %d", done, total);
         if (g_status)
             SendMessageA(g_status, SB_SETTEXTA, 0, (LPARAM)buf);
+#endif
 
         MSG msg;
+#ifdef _WIN32_WCE
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
+        {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+#else
         while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE))
         {
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
+#endif
     }
 }
 
@@ -1661,6 +2048,21 @@ static void populate_tracks(const std::string& album_key)
     for (size_t i = 0; i < a.tracks.size(); ++i) {
         Track& t = a.tracks[i];
 
+#ifdef _WIN32_WCE
+        LVITEMW item;
+        ZeroMemory(&item, sizeof(item));
+        item.mask = LVIF_TEXT;
+        item.iItem = index;
+        item.iSubItem = 0;
+        item.pszText = L"";
+        ListView_InsertItem(g_tracks, &item);
+
+        wchar_t numbuf[32];
+        if (t.meta.track > 0)
+            wsprintfW(numbuf, L"%d", t.meta.track);
+        else
+            wsprintfW(numbuf, L"%d", index + 1);
+#else
         LVITEMA item;
         ZeroMemory(&item, sizeof(item));
         item.mask = LVIF_TEXT;
@@ -1674,6 +2076,7 @@ static void populate_tracks(const std::string& album_key)
             wsprintfA(numbuf, "%d", t.meta.track);
         else
             wsprintfA(numbuf, "%d", index + 1);
+#endif
 
         std::string title_u8 = !t.meta.title.empty() ? t.meta.title : basenameA(t.path);
         std::string title_a = utf8_to_acp(title_u8);
@@ -1684,10 +2087,26 @@ static void populate_tracks(const std::string& album_key)
         char timebuf[16];
         format_mmss(t.duration_sec, timebuf);
 
+#ifdef _WIN32_WCE
+        ListView_SetItemText(g_tracks, index, 1, numbuf);
+        
+        wchar_t wtitle[1024];
+        MultiByteToWideChar(CP_UTF8, 0, title_a.c_str(), -1, wtitle, 1024);
+        ListView_SetItemText(g_tracks, index, 2, wtitle);
+        
+        wchar_t wartist[1024];
+        MultiByteToWideChar(CP_UTF8, 0, artist_a.c_str(), -1, wartist, 1024);
+        ListView_SetItemText(g_tracks, index, 3, wartist);
+        
+        wchar_t wtime[16];
+        MultiByteToWideChar(CP_UTF8, 0, timebuf, -1, wtime, 16);
+        ListView_SetItemText(g_tracks, index, 4, wtime);
+#else
         ListView_SetItemText(g_tracks, index, 1, numbuf);
         ListView_SetItemText(g_tracks, index, 2, (LPSTR)title_a.c_str());
         ListView_SetItemText(g_tracks, index, 3, (LPSTR)artist_a.c_str());
         ListView_SetItemText(g_tracks, index, 4, timebuf);
+#endif
 
         ++index;
     }
@@ -1696,7 +2115,11 @@ static void populate_tracks(const std::string& album_key)
         g_now_index >= 0 &&
         g_now_index < ListView_GetItemCount(g_tracks))
     {
+#ifdef _WIN32_WCE
+        ListView_SetItemText(g_tracks, g_now_index, 0, L">");
+#else
         ListView_SetItemText(g_tracks, g_now_index, 0, ">");
+#endif
         ListView_SetItemState(
             g_tracks,
             g_now_index,
@@ -1720,7 +2143,13 @@ static void refresh_album_list_labels()
 
         Album& a = it->second;
         a.disp_name = get_album_display_name(key, a);
+#ifdef _WIN32_WCE
+        wchar_t wdisp[1024];
+        MultiByteToWideChar(CP_UTF8, 0, a.disp_name.c_str(), -1, wdisp, 1024);
+        ListView_SetItemText(g_list, (int)i, 0, wdisp);
+#else
         ListView_SetItemText(g_list, (int)i, 0, (LPSTR)a.disp_name.c_str());
+#endif
     }
 }
 
@@ -1749,7 +2178,11 @@ static void seek_to_bar_pos(int bar_pos)
     double sec = ((double)bar_pos * (double)len_sec) / 1000.0;
     DWORD byte_pos = BASS_ChannelSeconds2Bytes(g_stream, sec);
 
+#ifdef _WIN32_WCE
+    BASS_ChannelSetPosition(g_stream, byte_pos, BASS_POS_BYTE);
+#else
     BASS_ChannelSetPosition(g_stream, byte_pos);
+#endif
 }
 
 static void update_seekbar_pos()
@@ -1757,19 +2190,31 @@ static void update_seekbar_pos()
     if (!g_seekbar) return;
     if (g_seek_dragging) return;
     if (!g_stream || g_now_album_key.empty() || g_now_index < 0) {
+#ifdef _WIN32_WCE
+        SendMessageW(g_seekbar, TBM_SETPOS, TRUE, 0);
+#else
         SendMessageA(g_seekbar, TBM_SETPOS, TRUE, 0);
+#endif
         return;
     }
 
     std::map<std::string, Album>::iterator it = g_albums.find(g_now_album_key);
     if (it == g_albums.end()) {
+#ifdef _WIN32_WCE
+        SendMessageW(g_seekbar, TBM_SETPOS, TRUE, 0);
+#else
         SendMessageA(g_seekbar, TBM_SETPOS, TRUE, 0);
+#endif
         return;
     }
 
     Album& a = it->second;
     if (g_now_index < 0 || g_now_index >= (int)a.tracks.size()) {
+#ifdef _WIN32_WCE
+        SendMessageW(g_seekbar, TBM_SETPOS, TRUE, 0);
+#else
         SendMessageA(g_seekbar, TBM_SETPOS, TRUE, 0);
+#endif
         return;
     }
 
@@ -1782,14 +2227,22 @@ static void update_seekbar_pos()
         st = BASS_ChannelIsActive(g_stream);
 
     if (g_stream && (st == BASS_ACTIVE_PLAYING || st == BASS_ACTIVE_PAUSED)) {
+#ifdef _WIN32_WCE
+        DWORD pos = BASS_ChannelGetPosition(g_stream, BASS_POS_BYTE);
+#else
         DWORD pos = BASS_ChannelGetPosition(g_stream);
+#endif
         if (pos != (DWORD)-1) {
             pos_sec = (int)BASS_ChannelBytes2Seconds(g_stream, pos);
         }
     }
 
     if (len_sec <= 0) {
+#ifdef _WIN32_WCE
+        SendMessageW(g_seekbar, TBM_SETPOS, TRUE, 0);
+#else
         SendMessageA(g_seekbar, TBM_SETPOS, TRUE, 0);
+#endif
         return;
     }
 
@@ -1800,7 +2253,11 @@ static void update_seekbar_pos()
     if (bar_pos < 0) bar_pos = 0;
     if (bar_pos > 1000) bar_pos = 1000;
 
+#ifdef _WIN32_WCE
+    SendMessageW(g_seekbar, TBM_SETPOS, TRUE, bar_pos);
+#else
     SendMessageA(g_seekbar, TBM_SETPOS, TRUE, bar_pos);
+#endif
 }
 
 static void update_playback_status()
@@ -1811,21 +2268,37 @@ static void update_playback_status()
         return;
 
     if (!g_stream || g_now_album_key.empty() || g_now_index < 0) {
+#ifdef _WIN32_WCE
+        SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)L"Ready");
+#else
         SendMessageA(g_status, SB_SETTEXTA, 0, (LPARAM)"Ready");
+#endif
         if (g_seekbar)
+#ifdef _WIN32_WCE
+            SendMessageW(g_seekbar, TBM_SETPOS, TRUE, 0);
+#else
             SendMessageA(g_seekbar, TBM_SETPOS, TRUE, 0);
+#endif
         return;
     }
 
     std::map<std::string, Album>::iterator it = g_albums.find(g_now_album_key);
     if (it == g_albums.end()) {
+#ifdef _WIN32_WCE
+        SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)L"Ready");
+#else
         SendMessageA(g_status, SB_SETTEXTA, 0, (LPARAM)"Ready");
+#endif
         return;
     }
 
     Album& a = it->second;
     if (g_now_index < 0 || g_now_index >= (int)a.tracks.size()) {
+#ifdef _WIN32_WCE
+        SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)L"Ready");
+#else
         SendMessageA(g_status, SB_SETTEXTA, 0, (LPARAM)"Ready");
+#endif
         return;
     }
 
@@ -1845,7 +2318,11 @@ static void update_playback_status()
         st = BASS_ChannelIsActive(g_stream);
 
     if (g_stream && (st == BASS_ACTIVE_PLAYING || st == BASS_ACTIVE_PAUSED)) {
+#ifdef _WIN32_WCE
+        DWORD pos = BASS_ChannelGetPosition(g_stream, BASS_POS_BYTE);
+#else
         DWORD pos = BASS_ChannelGetPosition(g_stream);
+#endif
         if (pos != (DWORD)-1) {
             pos_sec = (int)BASS_ChannelBytes2Seconds(g_stream, pos);
         }
@@ -1856,7 +2333,6 @@ static void update_playback_status()
 
     char posbuf[16];
     char lenbuf[16];
-    char text[1024];
 
     format_mmss(pos_sec, posbuf);
     format_mmss(len_sec, lenbuf);
@@ -1864,6 +2340,30 @@ static void update_playback_status()
     const char* state = "";
     if (st == BASS_ACTIVE_PAUSED)
         state = "[Paused] ";
+
+#ifdef _WIN32_WCE
+    wchar_t text[1024];
+    wchar_t wstate[32];
+    MultiByteToWideChar(CP_UTF8, 0, state, -1, wstate, 32);
+    wchar_t wposbuf[16];
+    MultiByteToWideChar(CP_UTF8, 0, posbuf, -1, wposbuf, 16);
+    wchar_t wlenbuf[16];
+    MultiByteToWideChar(CP_UTF8, 0, lenbuf, -1, wlenbuf, 16);
+    wchar_t wtitle[256];
+    MultiByteToWideChar(CP_UTF8, 0, title_a.c_str(), -1, wtitle, 256);
+    wchar_t wartist[256];
+    MultiByteToWideChar(CP_UTF8, 0, artist_a.c_str(), -1, wartist, 256);
+
+    if (!artist_a.empty())
+        wsprintfW(text, L"%s%s / %s  -  %s / %s",
+                  wstate, wposbuf, wlenbuf, wtitle, wartist);
+    else
+        wsprintfW(text, L"%s%s / %s  -  %s",
+                  wstate, wposbuf, wlenbuf, wtitle);
+
+    SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)text);
+#else
+    char text[1024];
 
     if (!artist_a.empty())
         wsprintfA(text, "%s%s / %s  -  %s / %s",
@@ -1873,6 +2373,7 @@ static void update_playback_status()
                   state, posbuf, lenbuf, title_a.c_str());
 
     SendMessageA(g_status, SB_SETTEXTA, 0, (LPARAM)text);
+#endif
     update_seekbar_pos();
 }
 
@@ -1899,7 +2400,13 @@ static void update_play_button_label()
             text = "Play";
     }
 
+#ifdef _WIN32_WCE
+    wchar_t wtext[16];
+    MultiByteToWideChar(CP_UTF8, 0, text, -1, wtext, 16);
+    SetWindowTextW(g_btn_play, wtext);
+#else
     SetWindowTextA(g_btn_play, text);
+#endif
 }
 
 static void layout_children(HWND h)
@@ -1964,20 +2471,74 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_CREATE: {
         InitCommonControls();
         g_hwnd = h;
+#ifdef _WIN32_WCE
+        g_list = CreateWindowW(WC_LISTVIEWW, L"",
+            WS_CHILD | WS_VISIBLE | LVS_ICON,
+            0, 0, 640, 480, h, (HMENU)1, GetModuleHandleW(NULL), 0);
+        if (!g_list) return -1;
+        
+        g_status = CreateWindowExW(
+            0, STATUSCLASSNAMEW, L"",
+            WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
+            0, 0, 0, 0,
+            h, (HMENU)2, GetModuleHandleW(NULL), 0);
+        if (!g_status) return -1;
+
+        SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)L"Ready"); 
+#else
         g_list = CreateWindowA(WC_LISTVIEWA, "",
             WS_CHILD | WS_VISIBLE | LVS_ICON,
             0, 0, 640, 480, h, (HMENU)1, 0, 0);
+        if (!g_list) return -1;
         
         g_status = CreateWindowExA(
             0, STATUSCLASSNAMEA, "",
             WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
             0, 0, 0, 0,
             h, (HMENU)2, GetModuleHandleA(NULL), 0);
+        if (!g_status) return -1;
 
         SendMessageA(g_status, SB_SETTEXTA, 0, (LPARAM)"Ready");
+#endif
 
         g_img = ImageList_Create(96, 96, ILC_COLOR16, 0, 32);
         ListView_SetImageList(g_list, g_img, LVSIL_NORMAL);
+#ifdef _WIN32_WCE
+        SendMessageW(g_list, LVM_SETTOOLTIPS, (WPARAM)NULL, 0);
+        
+        g_tip = CreateWindowExW(0, TOOLTIPS_CLASSW, NULL,
+            WS_POPUP | TTS_ALWAYSTIP,
+            CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+            h, NULL, GetModuleHandleW(NULL), NULL);
+
+        if (g_tip) {
+            SendMessageW(g_tip, TTM_SETMAXTIPWIDTH, 0, 400);
+            SendMessageW(g_tip, TTM_SETDELAYTIME, TTDT_INITIAL, 300);
+            SendMessageW(g_tip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 4000);
+        
+            TOOLINFOW ti;
+            ZeroMemory(&ti, sizeof(ti));
+            ti.cbSize = sizeof(ti);
+            ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+            ti.hwnd = h;                 // 親はメインウィンドウ
+            ti.uId  = (UINT_PTR)g_list;   // 対象はListView（HWNDをIDとして使う）
+            ti.lpszText = LPSTR_TEXTCALLBACKW; // 必要時に呼ぶ
+            SendMessageW(g_tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+        }
+
+        g_ui_font = CreateFontW(
+            -12, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            DEFAULT_QUALITY,
+            DEFAULT_PITCH | FF_DONTCARE,
+            L"MS UI Gothic"
+        );
+        if (g_ui_font) {
+            SendMessageW(g_list,   WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+        }
+#else
         SendMessageA(g_list, LVM_SETTOOLTIPS, (WPARAM)NULL, 0);
         
         g_tip = CreateWindowExA(0, TOOLTIPS_CLASSA, NULL,
@@ -2012,67 +2573,160 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (g_ui_font) {
             SendMessageA(g_list,   WM_SETFONT, (WPARAM)g_ui_font, TRUE);
         }
+#endif
 
         g_brush_btnface = CreateSolidBrush(GetSysColor(COLOR_BTNFACE));
 
+#ifdef _WIN32_WCE
+        g_tracks = CreateWindowW(WC_LISTVIEWW, L"",
+            WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL,
+            0, 0, 300, 300, h, (HMENU)3, GetModuleHandleW(NULL), 0);
+        if (!g_tracks) return -1;
+#else
         g_tracks = CreateWindowA(WC_LISTVIEWA, "",
             WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL,
             0, 0, 300, 300, h, (HMENU)3, 0, 0);
+        if (!g_tracks) return -1;
+#endif
 
         ListView_SetExtendedListViewStyle(g_tracks, LVS_EX_FULLROWSELECT);
 
+#ifdef _WIN32_WCE
+        LVCOLUMNW col;
+#else
         LVCOLUMNA col;
+#endif
         ZeroMemory(&col, sizeof(col));
         col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
 
+#ifdef _WIN32_WCE
+        col.pszText = L"";
+#else
         col.pszText = (LPSTR)"";
+#endif
         col.cx = 15;
         col.iSubItem = 0;
         ListView_InsertColumn(g_tracks, 0, &col);
 
+#ifdef _WIN32_WCE
+        col.pszText = L"#";
+#else
         col.pszText = (LPSTR)"#";
+#endif
         col.cx = 25;
         col.iSubItem = 1;
         ListView_InsertColumn(g_tracks, 1, &col);
 
+#ifdef _WIN32_WCE
+        col.pszText = L"Title";
+#else
         col.pszText = (LPSTR)"Title";
+#endif
         col.cx = 170;
         col.iSubItem = 2;
         ListView_InsertColumn(g_tracks, 2, &col);
 
+#ifdef _WIN32_WCE
+        col.pszText = L"Artist";
+#else
         col.pszText = (LPSTR)"Artist";
+#endif
         col.cx = 115;
         col.iSubItem = 3;
         ListView_InsertColumn(g_tracks, 3, &col);
 
+#ifdef _WIN32_WCE
+        col.pszText = L"Time";
+#else
         col.pszText = (LPSTR)"Time";
+#endif
         col.cx = 40;
         col.iSubItem = 4;
         ListView_InsertColumn(g_tracks, 4, &col);
 
+#ifdef _WIN32_WCE
+        g_btn_prev = CreateWindowW(
+            L"BUTTON", L"<<",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            0, 0, 40, 24,
+            h, (HMENU)IDC_BTN_PREV, g_inst, NULL);
+        if (!g_btn_prev) return -1;
+
+        g_btn_play = CreateWindowW(
+            L"BUTTON", L"Play",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            0, 0, 52, 24,
+            h, (HMENU)IDC_BTN_PLAY, g_inst, NULL);
+        if (!g_btn_play) return -1;
+
+        g_btn_next = CreateWindowW(
+            L"BUTTON", L">>",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            0, 0, 40, 24,
+            h, (HMENU)IDC_BTN_NEXT, g_inst, NULL);
+        if (!g_btn_next) return -1;
+
+        g_seekbar = CreateWindowW(
+            TRACKBAR_CLASSW, L"",
+            WS_CHILD | WS_VISIBLE | TBS_HORZ,
+            0, 0, 100, 24,
+            h, (HMENU)IDC_SEEKBAR, g_inst, NULL);
+        if (!g_seekbar) return -1;
+
+        g_volbar = CreateWindowW(
+            TRACKBAR_CLASSW,
+            L"",
+            WS_CHILD | WS_VISIBLE | TBS_HORZ,
+            0,0,100,24,
+            h,
+            (HMENU)IDC_VOLBAR,
+            g_inst,
+            NULL);
+        if (!g_volbar) return -1;
+        
+        g_vol_label = CreateWindowW(
+            L"STATIC",
+            L"Vol",
+            WS_CHILD | WS_VISIBLE,
+            0,0,30,20,
+            h,
+            NULL,
+            g_inst,
+            NULL);
+        if (!g_vol_label) return -1;
+
+        SendMessageW(g_seekbar, TBM_SETRANGE, TRUE, MAKELONG(0, 1000));
+        SendMessageW(g_seekbar, TBM_SETPOS, TRUE, 0);
+
+        SendMessageW(g_volbar, TBM_SETPOS, TRUE, 100);
+#else
         g_btn_prev = CreateWindowA(
             "BUTTON", "<<",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             0, 0, 40, 24,
             h, (HMENU)IDC_BTN_PREV, g_inst, NULL);
+        if (!g_btn_prev) return -1;
 
         g_btn_play = CreateWindowA(
             "BUTTON", "Play",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             0, 0, 52, 24,
             h, (HMENU)IDC_BTN_PLAY, g_inst, NULL);
+        if (!g_btn_play) return -1;
 
         g_btn_next = CreateWindowA(
             "BUTTON", ">>",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             0, 0, 40, 24,
             h, (HMENU)IDC_BTN_NEXT, g_inst, NULL);
+        if (!g_btn_next) return -1;
 
         g_seekbar = CreateWindowA(
             TRACKBAR_CLASSA, "",
             WS_CHILD | WS_VISIBLE | TBS_HORZ,
             0, 0, 100, 24,
             h, (HMENU)IDC_SEEKBAR, g_inst, NULL);
+        if (!g_seekbar) return -1;
 
         g_volbar = CreateWindowA(
             TRACKBAR_CLASSA,
@@ -2083,6 +2737,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             (HMENU)IDC_VOLBAR,
             g_inst,
             NULL);
+        if (!g_volbar) return -1;
         
         g_vol_label = CreateWindowA(
             "STATIC",
@@ -2093,12 +2748,32 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             NULL,
             g_inst,
             NULL);
+        if (!g_vol_label) return -1;
 
         SendMessageA(g_seekbar, TBM_SETRANGE, TRUE, MAKELONG(0, 1000));
         SendMessageA(g_seekbar, TBM_SETPOS, TRUE, 0);
 
         SendMessageA(g_volbar, TBM_SETPOS, TRUE, 100);
+#endif
 
+#ifdef _WIN32_WCE
+        // WinCEではSetWindowLongWが失敗する可能性があるため、サブクラス化を無効化
+        // g_old_list_proc = NULL;
+        // g_old_tracks_proc = NULL;
+        // g_old_seekbar_proc = NULL;
+        // g_old_volbar_proc = NULL;
+        g_old_list_proc =
+            (WNDPROC)SetWindowLongW(g_list, GWL_WNDPROC, (LONG)control_subclass_proc);
+
+        g_old_tracks_proc =
+            (WNDPROC)SetWindowLongW(g_tracks, GWL_WNDPROC, (LONG)control_subclass_proc);
+
+        g_old_seekbar_proc =
+            (WNDPROC)SetWindowLongW(g_seekbar, GWL_WNDPROC, (LONG)control_subclass_proc);
+
+        g_old_volbar_proc =
+            (WNDPROC)SetWindowLongW(g_volbar, GWL_WNDPROC, (LONG)control_subclass_proc);
+#else
         g_old_list_proc =
             (WNDPROC)SetWindowLongA(g_list, GWL_WNDPROC, (LONG)control_subclass_proc);
 
@@ -2110,16 +2785,27 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
         g_old_volbar_proc =
             (WNDPROC)SetWindowLongA(g_volbar, GWL_WNDPROC, (LONG)control_subclass_proc);
+#endif
         
         if (g_ui_font) {
+#ifdef _WIN32_WCE
+            SendMessageW(g_btn_prev, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+            SendMessageW(g_btn_play, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+            SendMessageW(g_btn_next, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+#else
             SendMessageA(g_btn_prev, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
             SendMessageA(g_btn_play, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
             SendMessageA(g_btn_next, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+#endif
         }
 
         SetTimer(h, TIMER_PLAYPOS, 300, NULL);
 
+#ifdef _WIN32_WCE
+        PostMessageW(h, WM_APP_STARTSCAN, 0, 0);
+#else
         PostMessageA(h, WM_APP_STARTSCAN, 0, 0);
+#endif
 
         layout_children(h);
         return 0;
@@ -2137,7 +2823,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             int sel = ListView_GetNextItem(g_list, -1, LVNI_SELECTED);
             if (sel >= 0) {
                 g_pending_sel = sel;
+#ifdef _WIN32_WCE
+                PostMessageW(h, WM_APP_PLAYSELECT, 0, 0);
+#else
                 PostMessageA(h, WM_APP_PLAYSELECT, 0, 0);
+#endif
             }
             return 0;
         }
@@ -2163,8 +2853,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
 
         // ★ツールチップのテキスト要求
+#ifdef _WIN32_WCE
+        if (hdr->hwndFrom == g_tip && hdr->code == TTN_NEEDTEXTW) {
+            NMTTDISPINFOW* di = (NMTTDISPINFOW*)l;
+#else
         if (hdr->hwndFrom == g_tip && hdr->code == TTN_NEEDTEXTA) {
             NMTTDISPINFOA* di = (NMTTDISPINFOA*)l;
+#endif
 
             POINT pt;
             GetCursorPos(&pt);
@@ -2197,19 +2892,38 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                             artU8 = "Unknown Artist";
                         std::string artA = utf8_to_acp(artU8);
 
+#ifdef _WIN32_WCE
+                        wchar_t albW[256];
+                        MultiByteToWideChar(CP_UTF8, 0, albA.c_str(), -1, albW, 256);
+                        wchar_t artW[256];
+                        MultiByteToWideChar(CP_UTF8, 0, artA.c_str(), -1, artW, 256);
+#endif
+
                         if (a.year > 0) {
+#ifdef _WIN32_WCE
+                            wsprintfW(g_tipbuf,
+                                L"%s\r\n%s\r\n%d tracks - %d",
+                                albW, artW, tracks, a.year);
+#else
                             wsprintfA(g_tipbuf,
                                 "%s\r\n%s\r\n%d tracks - %d",
                                 albA.c_str(),
                                 artA.c_str(),
                                 tracks,
                                 a.year);
+#endif
                         } else {
+#ifdef _WIN32_WCE
+                            wsprintfW(g_tipbuf,
+                                L"%s\r\n%s\r\n%d tracks",
+                                albW, artW, tracks);
+#else
                             wsprintfA(g_tipbuf,
                                 "%s\r\n%s\r\n%d tracks",
                                 albA.c_str(),
                                 artA.c_str(),
                                 tracks);
+#endif
                         }
 
                         di->lpszText = g_tipbuf;
@@ -2218,7 +2932,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 }
             }
 
+#ifdef _WIN32_WCE
+            di->lpszText = L"";
+#else
             di->lpszText = (LPSTR)"";
+#endif
             return 0;
         }
 
@@ -2253,7 +2971,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
         if (hw == g_volbar)
         {
+#ifdef _WIN32_WCE
+            int pos = SendMessageW(g_volbar, TBM_GETPOS, 0, 0);
+#else
             int pos = SendMessageA(g_volbar, TBM_GETPOS, 0, 0);
+#endif
 
             BASS_SetVolume(pos);
         }
@@ -2267,7 +2989,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
 
             if (code == TB_THUMBPOSITION || code == TB_ENDTRACK) {
+#ifdef _WIN32_WCE
+                int pos = (int)SendMessageW(g_seekbar, TBM_GETPOS, 0, 0);
+#else
                 int pos = (int)SendMessageA(g_seekbar, TBM_GETPOS, 0, 0);
+#endif
                 seek_to_bar_pos(pos);
                 g_seek_dragging = 0;
                 update_playback_status();
@@ -2276,7 +3002,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
             if (code == TB_LINEUP || code == TB_LINEDOWN ||
                 code == TB_PAGEUP || code == TB_PAGEDOWN) {
+#ifdef _WIN32_WCE
+                int pos = (int)SendMessageW(g_seekbar, TBM_GETPOS, 0, 0);
+#else
                 int pos = (int)SendMessageA(g_seekbar, TBM_GETPOS, 0, 0);
+#endif
                 seek_to_bar_pos(pos);
                 update_playback_status();
                 return 0;
@@ -2327,7 +3057,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             DWORD tid = 0;
             g_scan_thread = CreateThread(NULL, 0, ScanThreadProc, NULL, 0, &tid);
             if (!g_scan_thread) {
+#ifdef _WIN32_WCE
+                MessageBoxW(h, L"CreateThread failed", L"Album95", MB_OK | MB_ICONERROR);
+#else
                 MessageBoxA(h, "CreateThread failed", "Album95", MB_OK | MB_ICONERROR);
+#endif
                 return 0;
             }
             SetTimer(h, TIMER_SCANPROG, 200, NULL); // ★200msごとに表示更新
@@ -2337,9 +3071,15 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
     case WM_APP_SCANPROGRESS:
     {
+#ifdef _WIN32_WCE
+        wchar_t wbuf[256];
+        wsprintfW(wbuf, L"Album95 - Scanning... %ld files", (long)w);
+        SetWindowTextW(h, wbuf);
+#else
         char buf[256];
         wsprintfA(buf, "Album95 - Scanning... %ld files", (long)w);
         SetWindowTextA(h, buf);
+#endif
         return 0;
     }
 
@@ -2354,9 +3094,17 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
             const char* name = basenameA(f);
 
+#ifdef _WIN32_WCE
+            wchar_t buf[512];
+            wchar_t wname[256];
+            MultiByteToWideChar(CP_UTF8, 0, name ? name : "", -1, wname, 256);
+            wsprintfW(buf, L"Scanning... %ld files   %s", (long)n, wname);
+            if (g_status) SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)buf);
+#else
             char buf[512];
             wsprintfA(buf, "Scanning... %ld files   %s", (long)n, name ? name : "");
             if (g_status) SendMessageA(g_status, SB_SETTEXTA, 0, (LPARAM)buf);
+#endif
             return 0;
         }
         if (w == TIMER_PLAYPOS) {
@@ -2378,9 +3126,15 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
         g_status_mode = STATUSMODE_IDLE;
 
+#ifdef _WIN32_WCE
+        wchar_t buf[256];
+        wsprintfW(buf, L"Album95 - %ld files", (long)g_scan_count);
+        SetWindowTextW(h, buf);
+#else
         char buf[256];
         wsprintfA(buf, "Album95 - %ld files", (long)g_scan_count);
         SetWindowTextA(h, buf);
+#endif
 
         update_playback_status();
         return 0;
@@ -2449,14 +3203,37 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         PostQuitMessage(0);
         return 0;
     }
+#ifdef _WIN32_WCE
+    return DefWindowProcW(h, m, w, l);
+#else
     return DefWindowProcA(h, m, w, l);
+#endif
 }
 
+#ifdef _WIN32_WCE
+int WINAPI WinMain(HINSTANCE h, HINSTANCE, LPWSTR, int nCmdShow)
+#else
 int WINAPI WinMain(HINSTANCE h, HINSTANCE, LPSTR, int nCmdShow)
+#endif
 {
+#ifdef _WIN32_WCE
+    g_inst = GetModuleHandleW(NULL);
+#else
     g_inst = GetModuleHandleA(NULL);
+#endif
 
+#ifndef _WIN32_WCE
     SetUnhandledExceptionFilter(CrashFilter);
+#endif
+
+#ifdef _WIN32_WCE
+    HMODULE bass_dll = LoadLibraryW(L"bass.dll");
+    if (!bass_dll) {
+        MessageBoxW(NULL, L"Failed to load bass.dll", L"Album95", MB_OK | MB_ICONERROR);
+        return 0;
+    }
+#endif
+
     InitializeCriticalSection(&g_scan_cs);
 
     load_settings_from_ini();
@@ -2471,38 +3248,98 @@ int WINAPI WinMain(HINSTANCE h, HINSTANCE, LPSTR, int nCmdShow)
         save_settings_to_ini();
     }
 
-    if (!BASS_Init(-1, (DWORD)g_bass_rate, 0, 0, NULL)) {
+#ifdef _WIN32_WCE
+    if (!BASS_Init(-1, (DWORD)g_bass_rate, 0, NULL, NULL))
+#else
+    if (!BASS_Init(-1, (DWORD)g_bass_rate, 0, 0, NULL))
+#endif
+    {
+
+#ifdef _WIN32_WCE
+        MessageBoxW(NULL, L"BASS_Init failed", L"Album95", MB_OK);
+#else
         MessageBoxA(NULL, "BASS_Init failed", "Album95", MB_OK);
+#endif
         return 0;
     }
 
     BASS_SetVolume(100);
 
+#ifdef _WIN32_WCE
+    HMODULE aac_dll = LoadLibraryW(L"bass_aac.dll");
+    if (!aac_dll) {
+        MessageBoxW(NULL, L"Failed to load bass_aac.dll", L"Album95", MB_OK | MB_ICONERROR);
+        return 0;
+    }
+#endif
+
+#ifdef _WIN32_WCE
+    // WinCEではカレントディレクトリがないため、EXEと同じフォルダの絶対パスを作る
+    wchar_t plugin_path[MAX_PATH] = {0};
+    GetModuleFileNameW(NULL, plugin_path, MAX_PATH);
+    wchar_t* p = wcsrchr(plugin_path, L'\\');
+    if (p) {
+        wcscpy(p + 1, L"bass_aac.dll");
+    } else {
+        wcscpy(plugin_path, L"bass_aac.dll");
+    }
+    HPLUGIN plug = BASS_PluginLoad(plugin_path, BASS_UNICODE);
+#else
     HPLUGIN plug = BASS_PluginLoad("bass_aac.dll");
+#endif
     if (!plug) {
+#ifdef _WIN32_WCE
+        wchar_t buf[128];
+        wsprintfW(buf, L"BASS_PluginLoad(bass_aac.dll) failed. err=%d", BASS_ErrorGetCode());
+        MessageBoxW(NULL, buf, L"Album95", MB_OK);
+#else
         char buf[128];
         wsprintfA(buf, "BASS_PluginLoad(bass_aac.dll) failed. err=%d", BASS_ErrorGetCode());
         MessageBoxA(NULL, buf, "Album95", MB_OK);
+#endif
     }
 
+#ifdef _WIN32_WCE
+    WNDCLASSW wc;
+    ZeroMemory(&wc, sizeof(wc));
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = g_inst;
+    wc.lpszClassName = L"Album95";
+    RegisterClassW(&wc);
+#else
     WNDCLASSA wc;
     ZeroMemory(&wc, sizeof(wc));
     wc.lpfnWndProc = WndProc;
     wc.hInstance = g_inst;
     wc.lpszClassName = "Album95";
     RegisterClassA(&wc);
+#endif
 
+#ifdef _WIN32_WCE
+    HWND win = CreateWindowW(
+        L"Album95", L"Album95",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        100, 100, 720, 520,
+        0, 0, g_inst, 0);
+#else
     HWND win = CreateWindowA(
         "Album95", "Album95",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         100, 100, 720, 520,
         0, 0, g_inst, 0);
+#endif
 
     if (!win) {
         DWORD e = GetLastError();
+#ifdef _WIN32_WCE
+        wchar_t buf[256];
+        wsprintfW(buf, L"CreateWindowA failed. GetLastError=%lu", (unsigned long)e);
+        MessageBoxW(NULL, buf, L"Album95", MB_OK | MB_ICONERROR);
+#else
         char buf[256];
         wsprintfA(buf, "CreateWindowA failed. GetLastError=%lu", (unsigned long)e);
         MessageBoxA(NULL, buf, "Album95", MB_OK | MB_ICONERROR);
+#endif
         return 0;
     }
 
@@ -2514,9 +3351,16 @@ int WINAPI WinMain(HINSTANCE h, HINSTANCE, LPSTR, int nCmdShow)
     UpdateWindow(win);
 
     MSG msg;
+#ifdef _WIN32_WCE
+    while (GetMessageW(&msg, 0, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+#else
     while (GetMessageA(&msg, 0, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }
+#endif
     return 0;
 }

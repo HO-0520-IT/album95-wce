@@ -14,8 +14,11 @@ album95 の Windows CE （おそらく 4.0 以降）対応版です。
 1. Release より zip ファイルをダウンロードしてください。
 2. [BASS for WinCE](https://www.un4seen.com/forum/?topic=9534.0) より、 bass24-ce.zip と bass_aac-ce.zip をダウンロードしてください。
 3. 1 と 2 でダウンロードした、zipファイルをそれぞれ解凍し、 Album95.exe 、 bass.dll 、bass_aac.dll を抜き出してください。
-4. 3 で抜き出した3つのファイルを、何らかの方法で WinCE 実機に転送するか、 WinCE が読み取れるメモリカードの同じディレクトリに書き込んでください。
+4. 3 で抜き出した3つのファイルが同じディレクトリにあるように、何らかの方法で WinCE 実機に転送するか、 WinCE が読み取れるメモリカードに書き込んでください。
 5. WinCE 実機で Album95.exe を実行してください。
+
+## 備考
+このプログラムの一部は ChatGPT 、 Gemini 、 GitHub Copilot を使用して編集されました。
 
 ---
 

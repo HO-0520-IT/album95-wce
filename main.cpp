@@ -515,7 +515,16 @@ static bool mp4_get_safe(const char* tags, const char* key, std::string& out) {
             return true;
         }
         
-        // 次のタグへ
+        // 1文字目が小文字なら大文字化して再チェック
+        if (klen > 0 && key[0] >= 'a' && key[0] <= 'z') {
+            std::string key2 = key;
+            key2[0] = (char)(key2[0] - 'a' + 'A');
+            if (len > klen && strncmp(p, key2.c_str(), klen) == 0 && p[klen] == '=') {
+                out.assign(p + klen + 1);
+                return true;
+            }
+        }
+
         p += len + 1;
         if (p - tags > 65536) break;
     }

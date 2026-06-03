@@ -2986,7 +2986,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             int pos = SendMessageA(g_volbar, TBM_GETPOS, 0, 0);
 #endif
 
-            BASS_SetVolume(pos);
+            BASS_SetVolume((float)pos / 100.0f);
         }
 
         if (hw == g_seekbar) {
@@ -3272,7 +3272,7 @@ int WINAPI WinMain(HINSTANCE h, HINSTANCE, LPSTR, int nCmdShow)
         return 0;
     }
 
-    BASS_SetVolume(100);
+    BASS_SetVolume(1.0f);
 
 #ifdef _WIN32_WCE
     HMODULE aac_dll = LoadLibraryW(L"bass_aac.dll");
